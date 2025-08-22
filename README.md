@@ -1,0 +1,300 @@
+# Isaac Gym Wrapper — Usage & API
+
+This document describes a lightweight wrapper around NVIDIA Isaac Gym that makes it easy to build scenes with multiple environments, add rigid entities (robots/objects), and attach cameras. It’s split into two parts: **Example Usage** and a detailed **API Reference** covering `Scene`, `Rigid_entity`, and `Camera`.
+
+---
+
+## Example Usage
+
+```python
+from isaacgym import gymapi
+from scene import Scene
+
+# 1) Simulation parameters (PhysX)
+sim_params = gymapi.SimParams()
+sim_params.dt = 1/60
+sim_params.substeps = 2
+sim_params.up_axis = gymapi.UP_AXIS_Z
+sim_params.gravity = gymapi.Vec3(0.0, 0.0, -9.8)
+
+sim_params.physx.use_gpu = True
+sim_params.physx.solver_type = 1
+sim_params.physx.num_position_iterations = 6
+sim_params.physx.num_velocity_iterations = 1
+sim_params.physx.contact_offset = 0.01
+sim_params.physx.rest_offset = 0.0
+
+# 2) Create a scene with N parallel envs
+scene = Scene(
+    n_envs=16,
+    spacing=1.5,
+    sim_params=sim_params,
+    physics_engine=gymapi.SIM_PHYSX,
+    device_id=0,                 # CUDA device for physics
+    graphics_device_id=0,        # GPU for rendering
+    device="cuda:0",            # tensors device
+    headless=False,              # True for headless
+    virtual_screen_capture=False,
+    force_render=False,
+)
+
+# 3) Add a robot/object entity (URDF/mesh)
+robot = scene.add_entity(
+    asset_root="/path/to/assets",
+    asset_file="robot/robot.urdf",
+    pos=(0.0, 0.0, 0.0),
+    quat=(0.0, 0.0, 0.0, 1.0),
+    fixed=False,
+    robot=True,                  # enables robot-friendly asset options
+    disable_gravity=False,
+    drive_mode=None,             # None | 'pos' | 'vel' (see notes)
+    friction=1.0,
+    rolling_friction=0.01,
+    torsion_friction=0.01,
+)
+
+# 4) Add a camera (RGB)
+camera = scene.add_camera(
+    res=(1024, 768),
+    pos=gymapi.Vec3(0.0, 1.5, 1.8),
+    lookat=gymapi.Vec3(0.0, 0.75, 1.3),
+)
+
+# 5) Build (instantiates envs, actors, cameras, and state tensors)
+scene.build(cam_pos=(0.0, 1.5, 1.8), cam_target=(0.0, 0.75, 1.3))
+
+# 6) Control DOFs (example: position control to neutral)
+#    Shapes follow Isaac Gym tensors flattened across envs.
+if robot.n_dof:
+    import torch
+    q = torch.zeros(robot.n_dof * scene.n_envs, device=scene.device)
+    robot.set_dofs_position(q)
+
+# 7) Step simulation and (optionally) render viewer frames
+for _ in range(240):
+    scene.step()           # applies pending tensor writes, simulates, refreshes tensors
+    scene.render()         # draws to viewer (if not headless)
+
+# 8) Read states (e.g., per-env joint positions)
+q_pos = robot.get_dofs_position()        # shape: (n_envs, n_dof)
+link_pose = robot.get_link_pose("ee_link")  # shape: (n_envs, 7) [pos(3), quat(4)]
+
+# 9) Acquire camera images (GPU tensors)
+# imgs: (n_envs, H, W, C) in GPU memory (uint8)
+imgs = camera.render()
+```
+
+> **Notes**
+>
+> * Call `scene.build()` **after** adding all entities and cameras; it instantiates per-env actors/cameras and allocates state tensors.
+> * `Scene.step()` batches and applies all pending state updates (root, DOF, targets), runs one physics step, and refreshes Isaac tensors.
+> * `Scene.render()` updates the viewer and can optionally capture frames if `record_frames` is toggled (hotkey `R`).
+> * For programmatic camera RGB, use `Camera.render()` (returns stacked GPU tensors per env).
+
+---
+
+## API Reference
+
+### Scene
+
+**Constructor**
+
+```python
+Scene(
+  n_envs: int,
+  spacing: float,
+  sim_params: gymapi.SimParams,
+  physics_engine: int,            # e.g., gymapi.SIM_PHYSX
+  device_id: int,
+  graphics_device_id: int,
+  device: str,                    # e.g., "cuda:0" or "cpu"
+  headless: bool,
+  virtual_screen_capture: bool = False,
+  force_render: bool = False,
+)
+```
+
+Creates the simulator (`self.sim`), adds a Z-up ground plane, and prepares internal bookkeeping. Envs/actors/cameras aren’t created until `build()`.
+
+**Attributes (selected)**
+
+* `n_envs: int` — number of parallel environments.
+* `envs: list[gymapi.Env]` — per-env handles.
+* `entity_list: list[Rigid_entity]` — entities scheduled for instantiation.
+* `camera_list: list[Camera]` — cameras scheduled for instantiation.
+* Isaac tensors (after `build()`):
+
+  * `actor_root_state_tensor: (N_actors_total, 13)`
+  * `dof_state_tensor: (N_dofs_total, 2)` — \[pos, vel]
+  * `dof_force_tensor: (N_dofs_total, 1)`
+  * `rigid_body_state_tensor: (N_bodies_total, 13)`
+  * `net_contact_force_tensor: (N_bodies_total, 3)`
+
+**Methods**
+
+* ```python
+  build(cam_pos=(0.0, 1.5, 1.8), cam_target=(0.0, 0.75, 1.3)) -> None
+  ```
+
+  Creates an `envs_per_row` grid, instantiates all entities and cameras into every env, sets DOF properties (stiffness/damping if specified on entities), and allocates/wraps Isaac tensors. Also opens a `viewer` if `headless=False`.
+
+* ```python
+  add_entity(asset_root, asset_file, pos, quat, fixed,
+             robot=False, disable_gravity=False, drive_mode=None,
+             friction=1.0, rolling_friction=0.01, torsion_friction=0.01) -> Rigid_entity
+  ```
+
+  Schedules a rigid entity for instantiation in each env. Returns a `Rigid_entity` handle used for control and state queries.
+
+  * **`pos`**: `(x, y, z)` tuple (meters)
+  * **`quat`**: `(x, y, z, w)` tuple (unit quaternion)
+  * **`fixed`**: if `True`, base is fixed
+  * **`robot`**: enables robot-friendly asset options (e.g., damping, no joint collapse)
+  * **`drive_mode`**: planned support for `'pos'`/`'vel'`; default `None` (no default drive)
+  * **Friction terms** apply to rigid shapes of the actor
+
+* ```python
+  add_camera(res, pos, lookat) -> Camera
+  ```
+
+  Schedules an RGB camera (per env). See **Camera** API.
+
+* ```python
+  step() -> None
+  ```
+
+  Internals:
+
+  1. Apply pending tensor-indexed writes (root/DOF/targets)
+  2. `simulate()` one physics step
+  3. Refresh all Isaac tensors (root, DOF, rigid bodies, contacts, forces)
+
+* ```python
+  render(mode: str = "rgb_array") -> Optional[np.ndarray]
+  ```
+
+  Drives the viewer when present, handles hotkeys:
+
+  * `ESC` quit, `V` toggle viewer sync, `R` toggle frame capture.
+  * If `virtual_screen_capture=True` and `mode=="rgb_array"`, returns the grabbed frame as `np.ndarray`.
+
+* ```python
+  set_viewer(cam_pos, cam_target) -> None
+  ```
+
+  Creates a viewer (when `headless=False`) and sets initial camera look-at.
+
+> **Performance tip**: Use the provided tensor-indexed APIs on `Rigid_entity` for bulk updates across envs; they avoid per-actor API calls in Python loops.
+
+---
+
+### Rigid\_entity
+
+Represents one asset replicated into all envs. Holds per-env actor handles and DOF/body indices mapped into the flattened Isaac tensors.
+
+**Key fields**
+
+* `handles: list[int]` — per-env actor handles
+* `actor_indices: list[int]` — actor indices in `actor_root_state_tensor`
+* `dof_indices: list[list[int]]` — per-env DOF indices into global DOF tensors
+* `rigid_body_indices: list[list[int]]` — per-env rigid body indices
+* `n_dof: int | None` — number of DOFs (after `build()`)
+* `link_dict: dict[str, int]` — rigid body name → index (from asset)
+
+**Control / Setters** (all accept `env_ids: list[int] | None`)
+
+* ```python
+  set_pose(pos: torch.Tensor | tuple, quat: torch.Tensor | tuple, env_ids=None) -> None
+  ```
+
+  Queues a root pose write. `pos` shape `(3,)` or `(len(env_ids), 3)`; `quat` shape `(4,)` or `(len(env_ids), 4)`.
+
+* ```python
+  set_vel(vel, env_ids=None) -> None
+  ```
+
+  Queues root linear+angular velocity write. `vel` shape `(6,)` or `(len(env_ids), 6)`.
+
+* ```python
+  set_state(state, env_ids=None) -> None
+  ```
+
+  Queues full root state write. `state` shape `(13,)` or `(len(env_ids), 13)`.
+
+* ```python
+  set_dofs_state(state, env_ids=None) -> None
+  set_dofs_position(position, env_ids=None) -> None
+  control_dofs_position(position, env_ids=None) -> None
+  ```
+
+  * `state`: shape `(-1, 2)` flattened across DOFs; columns `[pos, vel]`.
+  * `set_dofs_position`: writes DOF pos + zero vel to the DOF state tensor.
+  * `control_dofs_position`: writes pos targets to the **position target** tensor (PD control must be enabled in DOF props).
+
+* ```python
+  set_dofs_kp(kp: float) -> None
+  set_dofs_kv(kv: float) -> None
+  set_friction(friction: float, env_ids=None) -> None
+  ```
+
+  Updates cached stiffness/damping (applied when actors are (re)created) and shape friction on existing actors.
+
+**Getters**
+
+* ```python
+  get_state(env_ids=None) -> torch.Tensor               # (len(env_ids), 13)
+  get_pose(env_ids=None) -> torch.Tensor                # (len(env_ids), 7)
+  get_vel(env_ids=None) -> torch.Tensor                 # (len(env_ids), 6)
+  get_dofs_state(env_ids=None) -> torch.Tensor          # (len(env_ids), n_dof, 2)
+  get_dofs_position(env_ids=None) -> torch.Tensor       # (len(env_ids), n_dof)
+  get_dofs_velocity(env_ids=None) -> torch.Tensor       # (len(env_ids), n_dof)
+  get_dofs_force(env_ids=None) -> torch.Tensor          # (len(env_ids), n_dof)
+  get_rigid_body_state(env_ids=None) -> torch.Tensor    # (len(env_ids), n_bodies, 13)
+  get_link_pose(name, env_ids=None) -> torch.Tensor     # (len(env_ids), 7)
+  get_link_state(name, env_ids=None) -> torch.Tensor    # (len(env_ids), 13)
+  get_link_contact_force(name, env_ids=None) -> torch.Tensor  # (len(env_ids), 3)
+  get_dofs_limit() -> tuple[torch.Tensor, torch.Tensor] # (lower, upper) each (n_dof,)
+  get_dofs_name() -> list[str]
+  ```
+
+> **Shapes** are given assuming tensors have been refreshed in the last `scene.step()`.
+
+---
+
+### Camera
+
+Represents one camera replicated per env. Images are produced on the GPU.
+
+**Constructor**
+
+```python
+Camera(scene, res: tuple[int, int], pos: gymapi.Vec3, lookat: gymapi.Vec3)
+```
+
+* `res`: `(width, height)`
+* `pos`: camera world position
+* `lookat`: camera world target (used in `Scene.build`)
+
+**Methods**
+
+* ```python
+  render() -> torch.Tensor
+  ```
+
+  Renders all camera sensors and returns a stacked GPU tensor of shape `(n_envs, H, W, C)`. Use `.cpu().numpy()` to move to CPU if needed.
+
+---
+
+## Utilities
+
+* `look_at_rotation(camera_pos, target_pos, up_vec=(0,0,1)) -> (x, y, z, w)` — helper to compute a quaternion that looks from `camera_pos` to `target_pos`.
+
+---
+
+## Gotchas & Tips
+
+* Always add all entities and cameras **before** calling `scene.build()`.
+* After queuing writes via any `set_*`/`control_*` calls, state actually updates in the simulator **on the next `scene.step()`**.
+* `control_dofs_position` writes to the **target** tensor; ensure DOFs are configured for position control (PD gains) for targets to take effect.
+* `Camera.render()` uses Isaac Gym’s GPU tensor API; prefer this over CPU readbacks for performance.
+* For mass, inertia, and advanced properties, consider domain randomization helpers in `Scene.apply_randomizations`.
